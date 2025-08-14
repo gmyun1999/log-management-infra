@@ -1,8 +1,12 @@
-version: "2.4"
+version: "3.9"
 services:
   haproxy:
     image: haproxy:2.4
-    container_name: haproxy
+    user: haproxy
+    entrypoint: >
+      sh -c "
+        exec haproxy -f /usr/local/etc/haproxy/haproxy.cfg
+      "
     depends_on:
       rabbit1:
         condition: service_healthy
@@ -10,33 +14,24 @@ services:
         condition: service_healthy
       rabbit3:
         condition: service_healthy
+    tmpfs:
+      - /tmp/haproxy:mode=1777,size=16m   # ← 핵심
     volumes:
+      # (★) 호스트의 cfg → 컨테이너 cfg
       - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
-      - ./haproxy/queue_ports.map:/etc/haproxy/queue_ports.map:ro
-      - ./haproxy/port_map.map:/etc/haproxy/port_map.map
-      - /var/run/haproxy.sock:/var/run/haproxy.sock
     ports:
-      - "50000-50100:50000-50100"
+      - "5672:5672"
+      - "${EXTERNAL_RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
     networks:
-      - elk-net
-
-  map-updater:
-    build:
-      context: ./haproxy
-      dockerfile: Dockerfile.map
-    container_name: haproxy-map-updater
-    depends_on:
-      haproxy:
-        condition: service_started
-    volumes:
-      - ./haproxy/queue_ports.map:/etc/haproxy/queue_ports.map:ro
-      - ./haproxy/port_map.map:/etc/haproxy/port_map.map
-      - /var/run/haproxy.sock:/var/run/haproxy.sock
-    entrypoint: ["/update_map.sh"]
+      elk-net:
+        aliases:
+          - haproxy
 
   # ─ RabbitMQ 3-node Quorum cluster ──────────────────────────
   rabbit1:
-    image: heidiks/rabbitmq-delayed-message-exchange:3.12.2-management
+    build:
+      context: ./rabbitmq-cluster
+      dockerfile: Dockerfile
     hostname: rabbit1
     container_name: rabbit1
     environment:
@@ -45,30 +40,29 @@ services:
       - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS}
       - RABBITMQ_NODENAME=${RABBITMQ_NODENAME_PREFIX}rabbit1
     volumes:
-      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
-      - ./rabbitmq/data/rabbit1:/var/lib/rabbitmq/mnesia
+      - ./rabbitmq-cluster/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq-cluster/data/rabbit1:/var/lib/rabbitmq/mnesia
     healthcheck:
-      test: ["CMD", "rabbitmqctl", "status"]
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
-    ports:
-      - "${EXTERNAL_HAPROXY_PORT}:5672"
-      - "${EXTERNAL_RABBITMQ_MANAGEMENT_PORT}:15672"
     networks:
       elk-net:
         aliases:
           - rabbit1
   rabbit2:
-    image: heidiks/rabbitmq-delayed-message-exchange:3.12.2-management
+    build:
+      context: ./rabbitmq-cluster
+      dockerfile: Dockerfile
     hostname: rabbit2
     container_name: rabbit2
     depends_on:
       rabbit1:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "rabbitmqctl", "status"]
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -79,8 +73,9 @@ services:
       - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS}
       - RABBITMQ_NODENAME=${RABBITMQ_NODENAME_PREFIX}rabbit2
     volumes:
-      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
-      - ./rabbitmq/data/rabbit2:/var/lib/rabbitmq/mnesia
+      - ./rabbitmq-cluster/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq-cluster/data/rabbit2:/var/lib/rabbitmq/mnesia
+      
     entrypoint: >
       bash -c "
         rabbitmq-server -detached &&
@@ -94,15 +89,18 @@ services:
       elk-net:
         aliases:
           - rabbit2
+          
   rabbit3:
-    image: heidiks/rabbitmq-delayed-message-exchange:3.12.2-management
+    build:
+      context: ./rabbitmq-cluster
+      dockerfile: Dockerfile
     hostname: rabbit3
     container_name: rabbit3
     depends_on:
       rabbit1:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "rabbitmqctl", "status"]
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -113,8 +111,8 @@ services:
       - RABBITMQ_DEFAULT_PASS=${RABBITMQ_DEFAULT_PASS}
       - RABBITMQ_NODENAME=${RABBITMQ_NODENAME_PREFIX}rabbit3
     volumes:
-      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
-      - ./rabbitmq/data/rabbit3:/var/lib/rabbitmq/mnesia
+      - ./rabbitmq-cluster/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq-cluster/data/rabbit3:/var/lib/rabbitmq/mnesia
     entrypoint: >
       bash -c "
         rabbitmq-server -detached &&
@@ -139,22 +137,37 @@ services:
       rabbit3:
         condition: service_healthy
     volumes:
-      - ./rabbitmq/definitions.json:/definitions.json:ro
+      - ./rabbitmq-cluster/definitions.json:/definitions.json:ro
     entrypoint: >
       sh -c '
-        echo "$(date) waiting for RabbitMQ cluster…";
-        until curl -s -u "${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}" \
-            http://rabbit1:15672/api/nodes | grep -q rabbit@rabbit3; do
-          sleep 5;
-        done;
-        echo "$(date) importing definitions…";
-        curl -u "${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}" \
-             -H "Content-Type: application/json" \
-             -X POST \
-             --data-binary @/definitions.json \
-             http://rabbit1:15672/api/definitions;
-        echo "$(date) done.";
+        set -eu
+        USER=$${RABBITMQ_DEFAULT_USER:-guest}
+        PASS=$${RABBITMQ_DEFAULT_PASS:-guest}
+        HOST="rabbit1:15672"
+
+        echo "$$(date) ⏳  waiting for rabbit1/2/3 to join…"
+        while :; do
+          json=$$(curl -s -u "$$USER:$$PASS" "http://$$HOST/api/nodes" || true)
+
+          echo "$$json" | grep -q "\"name\":\"rabbit@rabbit1\"" || { sleep 5; continue; }
+          echo "$$json" | grep -q "\"name\":\"rabbit@rabbit2\"" || { sleep 5; continue; }
+          echo "$$json" | grep -q "\"name\":\"rabbit@rabbit3\"" || { sleep 5; continue; }
+
+          break
+        done
+
+        echo "Waiting for 60 seconds...."
+        sleep 60
+
+        echo "$$(date) ✅  cluster ready. importing definitions…"
+        curl -sS -u "$$USER:$$PASS" -H "Content-Type: application/json" \
+            -X POST --data-binary @/definitions.json \
+            "http://$$HOST/api/definitions"
+        echo "$$(date) 🎉  done."
       '
+    networks:
+      - elk-net
+
   # ─ Elasticsearch ───────────────────────────────────────────
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.13.4
@@ -223,7 +236,7 @@ services:
         # 1) ES 준비 대기
         /usr/local/bin/wait-for-it.sh elasticsearch:9200 --strict --timeout=120 &&
         # 2) RabbitMQ 준비 대기
-        /usr/local/bin/wait-for-it.sh rabbitmq:5672 --strict --timeout=60 &&
+        /usr/local/bin/wait-for-it.sh haproxy:5672 --strict --timeout=60 &&
         # 3) 준비되면 Logstash 진짜 진입점 실행
         exec /usr/local/bin/docker-entrypoint
       "
@@ -239,14 +252,14 @@ services:
       - rabbit3
       - es-init
     volumes:
-      - ./logstash/pipeline1:/usr/share/logstash/pipeline
+      - ./logstash/pipeline2:/usr/share/logstash/pipeline
       - ./wait-for-it.sh:/usr/local/bin/wait-for-it.sh
     entrypoint: >
       bash -c "
         # 1) ES 준비 대기
         /usr/local/bin/wait-for-it.sh elasticsearch:9200 --strict --timeout=120 &&
         # 2) RabbitMQ 준비 대기
-        /usr/local/bin/wait-for-it.sh rabbitmq:5672 --strict --timeout=60 &&
+        /usr/local/bin/wait-for-it.sh haproxy:5672 --strict --timeout=60 &&
         # 3) 준비되면 Logstash 진짜 진입점 실행
         exec /usr/local/bin/docker-entrypoint
       "
@@ -262,14 +275,14 @@ services:
       - rabbit3
       - es-init
     volumes:
-      - ./logstash/pipeline1:/usr/share/logstash/pipeline
+      - ./logstash/pipeline3:/usr/share/logstash/pipeline
       - ./wait-for-it.sh:/usr/local/bin/wait-for-it.sh
     entrypoint: >
       bash -c "
         # 1) ES 준비 대기
         /usr/local/bin/wait-for-it.sh elasticsearch:9200 --strict --timeout=120 &&
         # 2) RabbitMQ 준비 대기
-        /usr/local/bin/wait-for-it.sh rabbitmq:5672 --strict --timeout=60 &&
+        /usr/local/bin/wait-for-it.sh haproxy:5672 --strict --timeout=60 &&
         # 3) 준비되면 Logstash 진짜 진입점 실행
         exec /usr/local/bin/docker-entrypoint
       "
